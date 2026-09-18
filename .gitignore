@@ -1,0 +1,14 @@
+.env
+*.json
+!**/samples.json
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+!**/body_*.json
+!**/.claude/settings.json
+**/chroma_db/
+**/chroma_*/
+
+# 개인 사진, 과거 블로그 글 원본(개인정보 포함) — 매장 정보(meta.txt)는 제외 대상 아님
+photos/
+corpus_raw/
