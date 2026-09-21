@@ -20,14 +20,17 @@ if not os.environ.get("OPENAI_API_KEY"):
 os.environ["LANGSMITH_TRACING"] = "true"
 os.environ["LANGSMITH_PROJECT"] = "blog-draft-agent"
 
-llm = init_chat_model("openai/gpt-5.6-luna", model_provider="litellm")
+# llm = init_chat_model("openai/gpt-5.6-luna", model_provider="litellm")
+llm = init_chat_model("openai/gpt-4o-mini", model_provider="litellm")
 
 emb = OpenAIEmbeddings(model="text-embedding-3-small")
-db = Chroma(persist_directory="chroma-db", embedding_function=emb)
+db = Chroma(persist_directory="chroma_db", embedding_function=emb)
 vision_client = OpenAI()
 
 PHOTO_ROOT = Path("meta")
 SKIP_SUFFIXES = {".mp4", ".mov"}
+
+DRY_RUN = True  # 임시: vision 호출 없이 코드 흐름만 확인
 
 
 def retrieve_style(query: str, k: int = 3) -> list[str]:
@@ -38,6 +41,9 @@ def retrieve_style(query: str, k: int = 3) -> list[str]:
 
 def describe_photo(path: Path) -> str:
     """사진 한 장을 블로그 본문에 쓸 수 있게 한두 문장으로 설명한다."""
+    if DRY_RUN:
+        return f"[사진 설명 생략(DRY_RUN): {path.name}]"
+
     data = base64.b64encode(path.read_bytes()).decode("utf-8")
     mime = "image/gif" if path.suffix.lower() == ".gif" else "image/jpeg"
     res = vision_client.chat.completions.create(
@@ -89,7 +95,7 @@ class State(TypedDict):
     tries: int
 
 
-MAX_TRIES = 3
+MAX_TRIES = 1
 
 
 class Verdict(BaseModel):
@@ -202,9 +208,16 @@ def write_posting_campaign(state: State) -> dict:
 
 def check_tone(state: State) -> dict:
     """본문이 기준(문체, 필수 정보 포함 등)을 지켰는지 평가한다. 본문을 고치지 않는다."""
-    # TODO: llm.with_structured_output(Verdict)를 만들고, 뭘 기준으로 합격/반려를 가릴지 지침을 정해 판정을 받는다.
-    #       (6강 ex06 evaluator 패턴 참고 — grader.invoke([...]))
-    verdict = ...  # TODO
+    grader = llm.with_structured_output(Verdict)
+
+    verdict = grader.invoke(
+        "다음 블로그 글이 아래 기준을 모두 지켰는지 판정한다. 하나라도 안 지켰으면 반려.\n"
+        "- 소제목과 문단 구분이 있다.\n"
+        "- 키워드를 나열하지 않고 직접 겪은 경험담 문장으로 녹여 썼다.\n"
+        "- 마지막에 과도한 홍보 문구나 클릭 유도가 없다.\n"
+        "- 사진을 설명한 문장 아래에 핵심 정보(가격 등)가 텍스트로 한 번 더 있다.\n\n"
+        f"=== 글 ===\n{state['posting']}"
+    )
     return {"grade": verdict.grade, "feedback": verdict.feedback}
 
 
@@ -214,10 +227,9 @@ def route_after_title(state: State) -> str:
 
 def route_after_check(state: State) -> str:
     """합격이거나 시도 상한이면 끝내고, 아니면 아까 그 글을 쓴 노드로 되돌린다."""
-    # TODO: state["grade"], state["tries"], MAX_TRIES를 보고
-    #       END로 보낼지, write_posting/write_posting_campaign 중 어디로 되돌릴지 정한다.
-    #       (되돌릴 노드는 route_after_title과 같은 기준으로 정하면 된다.)
-    ...  # TODO: return END 또는 "write_posting" 또는 "write_posting_campaign"
+    if state["grade"] == "합격" or state["tries"] >= MAX_TRIES:
+        return END
+    return "write_posting_campaign" if state["post_type"] == "체험단" else "write_posting"
 
 
 g = StateGraph(State)
@@ -237,3 +249,17 @@ g.add_conditional_edges("check_tone", route_after_check, ["write_posting", "writ
 graph = g.compile()
 
 print("노드:", list(g.nodes))
+
+result = graph.invoke({
+    "folders": {},
+    "meta": {},
+    "post_type": "",
+    "campaign_template": {},
+    "posting": "",
+    "feedback": "",
+    "grade": "",
+    "tries": 0,
+})
+
+Path("output.md").write_text(result["posting"], encoding="utf-8-sig")
+
