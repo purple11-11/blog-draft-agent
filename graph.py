@@ -1,11 +1,11 @@
 import base64
 import os
 import json
+import re
 from typing import Literal, TypedDict
 
 from dotenv import load_dotenv, find_dotenv
 from langchain.chat_models import init_chat_model
-from langchain.messages import HumanMessage, SystemMessage
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 from langgraph.graph import END, START, StateGraph
@@ -20,8 +20,8 @@ if not os.environ.get("OPENAI_API_KEY"):
 os.environ["LANGSMITH_TRACING"] = "true"
 os.environ["LANGSMITH_PROJECT"] = "blog-draft-agent"
 
-# llm = init_chat_model("openai/gpt-5.6-luna", model_provider="litellm")
-llm = init_chat_model("openai/gpt-4o-mini", model_provider="litellm")
+llm = init_chat_model("openai/gpt-5.6-luna", model_provider="litellm")
+# llm = init_chat_model("openai/gpt-4o-mini", model_provider="litellm")
 
 emb = OpenAIEmbeddings(model="text-embedding-3-small")
 db = Chroma(persist_directory="chroma_db", embedding_function=emb)
@@ -30,7 +30,7 @@ vision_client = OpenAI()
 PHOTO_ROOT = Path("meta")
 SKIP_SUFFIXES = {".mp4", ".mov"}
 
-DRY_RUN = True  # 임시: vision 호출 없이 코드 흐름만 확인
+DRY_RUN = False  # 임시: vision 호출 없이 코드 흐름만 확인
 
 
 def retrieve_style(query: str, k: int = 3) -> list[str]:
@@ -85,8 +85,7 @@ def describe_menu(folder: Path) -> str:
 
 
 class State(TypedDict):
-    folders: dict           # 섹션 이름 -> 그 섹션의 사진 경로 목록
-    meta: dict               # meta.txt를 읽어 만든 가게 정보 (가게 이름, 주소, post_type 등)
+    meta: dict               # meta.json을 읽어 만든 가게 정보 (가게 이름, post_type, keyword, title 등)
     post_type: str            # "내돈내산" 또는 "체험단"
     campaign_template: dict  # 체험단일 때 업체 요구 양식 (내돈내산이면 빈 dict)
     posting: str
@@ -95,7 +94,7 @@ class State(TypedDict):
     tries: int
 
 
-MAX_TRIES = 1
+MAX_TRIES = 3
 
 
 class Verdict(BaseModel):
@@ -109,30 +108,30 @@ def keyword_extract(state: State) -> dict:
     post_type = meta["post_type"]
     campaign_template = meta.get("campaign_template", {})
 
-    query = meta["name"]
-    posts = retrieve_style(query, k=3)
-    past_posts_text = "\n---\n".join(posts)
-
     if post_type == "체험단":
-        keyword_guide = f"'{campaign_template['필수 키워드']}' 중 1개를 키워드에 필수로 사용한다."
+        prompt = (
+            f"'{campaign_template['필수 키워드']}' 중 1개를 키워드에 필수로 사용한다. "
+            "키워드는 각 10자 이내로 작성한다."
+        )
     else:
-        keyword_guide = (
-            "과거에 작성한 다음 글들의 '지역, 메뉴, 상황어 나열' 키워드 패턴을 따라, "
-            f"이번 가게({meta['name']})에 어울리는 키워드를 만든다."
+        posts = retrieve_style(f"{meta['name']} 맛집", k=3)
+        past_posts_text = "\n---\n".join(posts)
+        prompt = (
+            "과거에 작성한 다음 글들의 '지역, 메뉴, 상황어 나열' 키워드 패턴(형식)만 참고해, "
+            f"이번 가게({meta['name']})에 어울리는 키워드를 만든다. "
+            "키워드에 들어갈 지역·메뉴는 이번 가게 이름에 있는 정보만 쓰고, "
+            "참고 글에 나온 다른 가게의 이름이나 장소는 가져오지 않는다. "
+            "키워드는 각 10자 이내로 작성한다.\n\n"
+            f"=== 과거 글(형식만 참고) ===\n{past_posts_text}"
         )
 
-    keyword = llm.invoke(
-        f"{keyword_guide} 키워드는 각 10자 이내로 작성한다.\n\n"
-        f"=== 과거 글 ===\n{past_posts_text}"
-    ).content
-    
+    keyword = llm.invoke(prompt).content
 
     return {
-            "meta": {**meta, 
-            "keyword": keyword}, 
-            "post_type":post_type,
-            "campaign_template": campaign_template
-            }
+        "meta": {**meta, "keyword": keyword},
+        "post_type": post_type,
+        "campaign_template": campaign_template,
+    }
 
 
 def title(state: State) -> dict:
@@ -145,7 +144,8 @@ def title(state: State) -> dict:
         title_guide = f"'{meta['keyword']}'를 자연스럽게 녹여 제목을 만든다."
 
     generated_title = llm.invoke(
-        f"과거 작성한 글의 제목 패턴을 참고해 초안의 제목을 생성한다. {title_guide} "
+        f"과거 작성한 글의 제목 패턴을 참고해 초안의 제목을 생성한다. "
+        f"가게 이름('{meta['name']}')을 반드시 포함한다. {title_guide} "
         "제목에 특수문자를 넣지 않고, 20자를 넘지 않는다."
     ).content.strip()
 
@@ -153,31 +153,63 @@ def title(state: State) -> dict:
 
 
 
+CLOSING_SIGNATURE = "\n\n끝까지 읽어주셔서 감사합니다!\n다들 밥 꼭 챙겨드세요~🍚"
+
+TEMPLATE_SKELETON = """<방문 요일·시간, 웨이팅 여부를 담백한 한 문장으로만 쓴다. 미사여구 없이 사실만 적는다.>
+
+📍 주소
+📞 전화
+⏰ 영업시간
+🚗 주차
+✅ 방문 시기 :
+
+## 매장 분위기
+
+## Menu
+저희는
+
+✔ <메뉴명> (₩ <가격>)
+✔ <메뉴명> (₩ <가격>) <수량이 있으면 x숫자>
+
+주문했습니다.
+
+## 마무리
+✔ 이런 사람에게 추천
+<메뉴·분위기 재료를 바탕으로 2~3개, '-'로 시작하는 목록>"""
+
+
+CLICHES = "'발걸음을 멈추게 하다', '안성맞춤이다', '~을 놓치지 마세요' 등"
+
+STYLE_RULES = (
+    f"- 상투적이고 감상적인 미사여구({CLICHES})는 쓰지 않는다.\n"
+    "- 곁들이는 반찬·조리 방식·맛·식감처럼 재료에 없는 세부 사실은 지어내지 않는다. "
+    "메뉴 종류만 보고 조리법이나 맛을 통념으로 단정하지 않는다.\n"
+    "- 같은 문장 어미나 단어·표현 조합을 여러 문단에서 반복하지 않는다.\n"
+    "- '참고할 과거 글'은 실제 문체 예시다. 존댓말/반말 섞임, 이모티콘·'ㅋㅋ' 사용 여부, "
+    "문장 길이와 끊어 쓰는 방식을 그대로 따라 쓰되, 그 글의 가게 이름·장소는 가져오지 않는다.\n"
+)
+
+
 def build_posting_instruction(state: State, extra_requirements: str = "") -> str:
     """write_posting과 write_posting_campaign이 함께 쓰는 지침 조립 함수."""
     meta = state["meta"]
 
-    store_info = {k: v for k, v in meta.items() if k not in ("keyword", "title", "campaign_template")}
-
     sections_text = "\n\n".join([
-        f"[대표사진]\n{describe_section(PHOTO_ROOT / '1_대표사진')}",
-        f"[가게외관]\n{describe_section(PHOTO_ROOT / '2_가게외관')}",
-        f"[매장 정보]\n{json.dumps(store_info, ensure_ascii=False)}",
         f"[매장분위기]\n{describe_section(PHOTO_ROOT / '3_매장분위기')}",
         f"[메뉴]\n{describe_menu(PHOTO_ROOT / '4_메뉴')}",
     ])
 
-    past_posts = "\n---\n".join(retrieve_style(meta["name"], k=2))
+    past_posts = "\n---\n".join(retrieve_style(meta["keyword"], k=2))
 
     instruction = (
-        f"아래 정보를 바탕으로 네이버 블로그 글 본문을 쓴다. 제목은 '{meta.get('title', '')}'이다.\n"
-        "소제목([대표사진], [가게외관] 같은 이름 말고 자연스러운 소제목)과 문단 나누기를 적극 활용한다.\n"
-        "첫 부분에는 이 가게를 방문하기 좋은 상황(맥락)을 자연스러운 문장으로 쓴다.\n"
-        "사진을 설명한 문장 아래에는 핵심 정보(가격, 특징)를 한 번 더 텍스트로 짚어준다.\n"
-        "키워드를 나열하지 말고, 직접 겪은 경험담 문장으로 자연스럽게 녹여 쓴다.\n"
-        "마지막은 홍보성 문구나 클릭 유도 없이, 담백한 방문 팁으로 마무리한다.\n"
+        f"아래 정보로 네이버 블로그 글 본문을 쓴다. 제목은 '{meta.get('title', '')}'이다.\n"
+        "아래 템플릿의 헤딩과 '✔'·'📍' 같은 라벨은 그대로 쓰고 <> 안만 채운다. "
+        "템플릿에 없는 문장·섹션, '지도' 관련 내용, '비추천' 목록은 추가하지 않는다.\n\n"
+        f"=== 템플릿 ===\n{TEMPLATE_SKELETON}\n\n"
+        "메뉴 항목은 '이번 글 재료'의 요리명·가격 정보만 그대로 쓴다.\n"
+        f"{STYLE_RULES}"
         f"{extra_requirements}\n\n"
-        f"=== 참고할 과거 글(문체 참고용) ===\n{past_posts}\n\n"
+        f"=== 참고할 과거 글(말투만 참고, 내용은 무시) ===\n{past_posts}\n\n"
         f"=== 이번 글 재료 ===\n{sections_text}"
     )
 
@@ -190,19 +222,24 @@ def build_posting_instruction(state: State, extra_requirements: str = "") -> str
 def write_posting(state: State) -> dict:
     """내돈내산 글 본문을 쓴다. feedback이 있으면 반영해 다시 쓴다."""
     instruction = build_posting_instruction(state)
-    result = llm.invoke(instruction).content
+    title_line = f"# {state['meta'].get('title', '')}\n\n"
+    result = title_line + llm.invoke(instruction).content + CLOSING_SIGNATURE
     return {"posting": result, "tries": state["tries"] + 1}
 
 
 def write_posting_campaign(state: State) -> dict:
     """체험단 글 본문을 쓴다. campaign_template(업체 요구 양식)을 반영한다."""
-    campaign = state["campaign_template"]
+    meta = state["meta"]
+    posting_length = state["campaign_template"].get("포스팅 분량", "")
     extra_requirements = (
-        "\n이 글은 체험단 원고다. 다음 업체 요구사항을 반드시 지킨다.\n"
-        f"{json.dumps(campaign, ensure_ascii=False)}"
+        "\n이 글은 체험단 원고다. "
+        f"필수 키워드는 이미 '{meta['keyword']}'로 정해졌으니 이 키워드 하나만 자연스럽게 한 번 넣는다 "
+        "(업체가 준 필수 키워드 목록 전체를 억지로 다 넣지 않는다). "
+        f"분량 요구사항: {posting_length}"
     )
     instruction = build_posting_instruction(state, extra_requirements=extra_requirements)
-    result = llm.invoke(instruction).content
+    title_line = f"# {meta.get('title', '')}\n\n"
+    result = title_line + llm.invoke(instruction).content + CLOSING_SIGNATURE
     return {"posting": result, "tries": state["tries"] + 1}
 
 
@@ -212,10 +249,11 @@ def check_tone(state: State) -> dict:
 
     verdict = grader.invoke(
         "다음 블로그 글이 아래 기준을 모두 지켰는지 판정한다. 하나라도 안 지켰으면 반려.\n"
-        "- 소제목과 문단 구분이 있다.\n"
-        "- 키워드를 나열하지 않고 직접 겪은 경험담 문장으로 녹여 썼다.\n"
-        "- 마지막에 과도한 홍보 문구나 클릭 유도가 없다.\n"
-        "- 사진을 설명한 문장 아래에 핵심 정보(가격 등)가 텍스트로 한 번 더 있다.\n\n"
+        "- '매장 분위기', 'Menu', '마무리' 헤딩과 '✔' 라벨이 그대로 있고, "
+        "템플릿에 없는 문장이나 섹션을 추가하지 않았다.\n"
+        "- '비추천' 목록이나 '지도' 관련 내용이 없다.\n"
+        "- 메뉴 항목이 실제 재료(요리명·가격)와 일치한다.\n"
+        f"- 상투적이고 감상적인 미사여구({CLICHES})가 없다.\n\n"
         f"=== 글 ===\n{state['posting']}"
     )
     return {"grade": verdict.grade, "feedback": verdict.feedback}
@@ -251,7 +289,6 @@ graph = g.compile()
 print("노드:", list(g.nodes))
 
 result = graph.invoke({
-    "folders": {},
     "meta": {},
     "post_type": "",
     "campaign_template": {},
@@ -261,5 +298,18 @@ result = graph.invoke({
     "tries": 0,
 })
 
-Path("output.md").write_text(result["posting"], encoding="utf-8-sig")
+def next_output_path(root: Path = Path(".")) -> Path:
+    """output.md, output2.md, ... 중 가장 큰 번호 다음 파일 경로를 돌려준다."""
+    numbers = [0]
+    for p in root.glob("output*.md"):
+        m = re.fullmatch(r"output(\d*)\.md", p.name)
+        if m:
+            numbers.append(int(m.group(1)) if m.group(1) else 1)
+    next_n = max(numbers) + 1
+    return Path(f"output{next_n}.md")
+
+
+out_path = next_output_path()
+out_path.write_text(result["posting"], encoding="utf-8-sig")
+print("저장 위치:", out_path)
 
