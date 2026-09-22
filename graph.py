@@ -2,6 +2,8 @@ import base64
 import os
 import json
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal, TypedDict
 
 from dotenv import load_dotenv, find_dotenv
@@ -29,6 +31,7 @@ vision_client = OpenAI()
 
 PHOTO_ROOT = Path("meta")
 SKIP_SUFFIXES = {".mp4", ".mov"}
+MAX_WORKERS = 4  # vision 호출을 동시에 몇 개까지 보낼지 (rate limit 고려)
 
 DRY_RUN = False  # 임시: vision 호출 없이 코드 흐름만 확인
 
@@ -59,14 +62,18 @@ def describe_photo(path: Path) -> str:
     return res.choices[0].message.content.strip()
 
 
+def describe_photos(photos: list[Path]) -> list[str]:
+    """사진 여러 장을 동시에(병렬로) 설명한다."""
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        results = list(pool.map(describe_photo, photos))
+    return results
+
+
 def describe_section(folder: Path) -> str:
     """폴더 안 사진들을 전부 설명해 이어 붙인다. 동영상·하위 폴더는 건너뛴다."""
-    lines = []
-    for photo in sorted(folder.iterdir()):
-        if photo.is_dir() or photo.name.startswith(".") or photo.suffix.lower() in SKIP_SUFFIXES:
-            continue
-        lines.append(describe_photo(photo))
-    return "\n".join(lines)
+    photos = [p for p in sorted(folder.iterdir())
+              if not p.is_dir() and not p.name.startswith(".") and p.suffix.lower() not in SKIP_SUFFIXES]
+    return "\n".join(describe_photos(photos))
 
 
 def describe_menu(folder: Path) -> str:
@@ -78,11 +85,10 @@ def describe_menu(folder: Path) -> str:
     for dish_dir in sorted(p for p in folder.iterdir() if p.is_dir()):
         photos = [p for p in sorted(dish_dir.iterdir())
                   if p.suffix.lower() not in SKIP_SUFFIXES and not p.name.startswith(".")]
-        descs = "\n".join(describe_photo(p) for p in photos)
+        descs = "\n".join(describe_photos(photos))
         dish_blocks.append(f"[{dish_dir.name}]\n{descs}")
 
     return f"=== 가격 정보 ===\n{prices}\n\n=== 요리별 사진 설명 ===\n" + "\n\n".join(dish_blocks)
-
 
 class State(TypedDict):
     meta: dict               # meta.json을 읽어 만든 가게 정보 (가게 이름, post_type, keyword, title 등)
@@ -199,7 +205,7 @@ def build_posting_instruction(state: State, extra_requirements: str = "") -> str
         f"[메뉴]\n{describe_menu(PHOTO_ROOT / '4_메뉴')}",
     ])
 
-    past_posts = "\n---\n".join(retrieve_style(meta["keyword"], k=2))
+    past_posts = "\n---\n".join(retrieve_style(meta["keyword"], k=20))
 
     instruction = (
         f"아래 정보로 네이버 블로그 글 본문을 쓴다. 제목은 '{meta.get('title', '')}'이다.\n"
@@ -288,6 +294,9 @@ graph = g.compile()
 
 print("노드:", list(g.nodes))
 
+run_started = time.strftime("%H:%M:%S")
+run_t0 = time.perf_counter()
+
 result = graph.invoke({
     "meta": {},
     "post_type": "",
@@ -297,6 +306,10 @@ result = graph.invoke({
     "grade": "",
     "tries": 0,
 })
+
+run_elapsed = time.perf_counter() - run_t0
+run_ended = time.strftime("%H:%M:%S")
+print(f"[전체 실행] 시작 {run_started} -> 종료 {run_ended} ({run_elapsed:.2f}초)")
 
 def next_output_path(root: Path = Path(".")) -> Path:
     """output.md, output2.md, ... 중 가장 큰 번호 다음 파일 경로를 돌려준다."""
